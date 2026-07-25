@@ -241,6 +241,20 @@ source: crates/oxc_linter/src/tester.rs
    ╰────
   help: Use `exports` instead.
 
+  ⚠ node(exports-style): Unexpected access to `module.exports`.
+   ╭─[exports_style.tsx:1:1]
+ 1 │ (module).exports = {foo: 1}
+   · ────────────────
+   ╰────
+  help: Use `exports` instead.
+
+  ⚠ node(exports-style): Unexpected access to `module.exports`.
+   ╭─[exports_style.tsx:1:1]
+ 1 │ (module as any).exports = {foo: 1}
+   · ───────────────────────
+   ╰────
+  help: Use `exports` instead.
+
   ⚠ node(exports-style): Unexpected assignment to `exports`.
    ╭─[exports_style.tsx:1:38]
  1 │ module.exports = exports = {foo: 1}; exports = obj

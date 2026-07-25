@@ -1,21 +1,19 @@
 use oxc_ast::{
-    AstKind, MemberExpressionKind,
+    AstKind,
     ast::{AssignmentExpression, Expression},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
-use oxc_semantic::NodeId;
+use oxc_semantic::{NodeId, ReferenceId};
 use oxc_span::{GetSpan, Span};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    config::GlobalValue,
     context::LintContext,
     rule::{Rule, TupleRuleConfig},
-    utils::{
-        is_global_exports_assignment_target, is_global_exports_reference, is_global_module_exports,
-        is_global_module_reference,
-    },
+    utils::{is_global_exports_assignment_target, is_global_module_exports},
 };
 
 fn unexpected_exports_diagnostic(span: Span) -> OxcDiagnostic {
@@ -134,106 +132,96 @@ impl Rule for ExportsStyle {
 impl ExportsStyle {
     /// Report every reference to the global `exports` (the `"module.exports"` mode).
     fn check_exports_references(&self, ctx: &LintContext) {
-        let Some(references) = ctx.scoping().root_unresolved_references().get("exports") else {
-            return;
-        };
-        for &reference_id in references {
-            let reference = ctx.scoping().get_reference(reference_id);
-            let node = ctx.nodes().get_node(reference.node_id());
-            let AstKind::IdentifierReference(ident) = node.kind() else {
-                continue;
-            };
-            if !is_global_exports_reference(ident, ctx) {
-                continue;
-            }
+        for &reference_id in global_reference_ids("exports", ctx) {
+            let node_id = ctx.scoping().get_reference(reference_id).node_id();
 
             if self.1.allow_batch_assign
-                && top_assignment_id(node.id(), ctx)
+                && top_assignment_id(node_id, ctx)
                     .is_some_and(|top| assignment_chain_has_module_exports(top, ctx))
             {
                 continue;
             }
 
-            ctx.diagnostic(unexpected_exports_diagnostic(ident.span));
+            ctx.diagnostic(unexpected_exports_diagnostic(ctx.nodes().kind(node_id).span()));
         }
     }
 
     /// Report every `module.exports` access and every assignment to the global `exports`
-    /// (the `"exports"` mode). Diagnostics are collected and emitted in source order,
-    /// matching the previous single-pass emission order.
+    /// (the `"exports"` mode). The two reference lists are walked separately, so diagnostics
+    /// are collected and emitted in source order to match a single AST pass.
     fn check_module_exports_references(&self, ctx: &LintContext) {
-        let mut diagnostics: Vec<(u32, OxcDiagnostic)> = Vec::new();
+        let mut diagnostics: Vec<(Span, OxcDiagnostic)> = Vec::new();
 
-        if let Some(references) = ctx.scoping().root_unresolved_references().get("module") {
-            for &reference_id in references {
-                let reference = ctx.scoping().get_reference(reference_id);
-                let node = ctx.nodes().get_node(reference.node_id());
-                let AstKind::IdentifierReference(_) = node.kind() else {
-                    continue;
-                };
-                let member_id = outermost_wrapped_expression_id(node.id(), ctx);
-                let member_expr = match ctx.nodes().parent_kind(member_id) {
-                    AstKind::StaticMemberExpression(member_expr) => {
-                        MemberExpressionKind::Static(member_expr)
-                    }
-                    AstKind::ComputedMemberExpression(member_expr) => {
-                        MemberExpressionKind::Computed(member_expr)
-                    }
-                    _ => continue,
-                };
-                if !is_global_module_exports_kind(&member_expr, ctx) {
-                    continue;
-                }
-
-                if self.1.allow_batch_assign
-                    && top_assignment_id(ctx.nodes().parent_id(member_id), ctx)
-                        .is_some_and(|top| assignment_chain_has_exports(top, ctx))
-                {
-                    continue;
-                }
-
-                let span = member_expr.span();
-                diagnostics.push((span.start, unexpected_module_exports_diagnostic(span)));
+        for &reference_id in global_reference_ids("module", ctx) {
+            let node_id = ctx.scoping().get_reference(reference_id).node_id();
+            // The object of `module.exports` may be wrapped, as in `(module as any).exports`.
+            let object_id = outermost_wrapped_expression_id(node_id, ctx);
+            let member_id = ctx.nodes().parent_id(object_id);
+            let Some(member_expr) = ctx.nodes().kind(member_id).as_member_expression_kind() else {
+                continue;
+            };
+            // Skip `module` in property position (`foo[module]`) and any property but `exports`.
+            if member_expr.object().node_id() != object_id
+                || !member_expr.static_property_name().is_some_and(|name| name == "exports")
+            {
+                continue;
             }
+
+            if self.1.allow_batch_assign
+                && top_assignment_id(member_id, ctx)
+                    .is_some_and(|top| assignment_chain_has_exports(top, ctx))
+            {
+                continue;
+            }
+
+            let span = member_expr.span();
+            diagnostics.push((span, unexpected_module_exports_diagnostic(span)));
         }
 
-        if let Some(references) = ctx.scoping().root_unresolved_references().get("exports") {
-            for &reference_id in references {
-                let reference = ctx.scoping().get_reference(reference_id);
-                let node = ctx.nodes().get_node(reference.node_id());
-                let AstKind::IdentifierReference(ident) = node.kind() else {
-                    continue;
-                };
-                let AstKind::AssignmentExpression(assign_expr) = ctx.nodes().parent_kind(node.id())
-                else {
-                    continue;
-                };
-                // The reference must be the assignment target itself, not part of the
-                // right-hand side of the same assignment.
-                if assign_expr.left.span() != ident.span {
-                    continue;
-                }
-                if !is_global_exports_assignment_target(&assign_expr.left, ctx) {
-                    continue;
-                }
-
-                if self.1.allow_batch_assign
-                    && top_assignment_from_assignment_id(ctx.nodes().parent_id(node.id()), ctx)
-                        .is_some_and(|top| assignment_chain_has_module_exports(top, ctx))
-                {
-                    continue;
-                }
-
-                let span = assign_expr.left.span();
-                diagnostics.push((span.start, unexpected_assignment_diagnostic(span)));
+        for &reference_id in global_reference_ids("exports", ctx) {
+            let node_id = ctx.scoping().get_reference(reference_id).node_id();
+            let assign_id = ctx.nodes().parent_id(node_id);
+            let AstKind::AssignmentExpression(assign_expr) = ctx.nodes().kind(assign_id) else {
+                continue;
+            };
+            // The reference must be the assignment target itself, not part of the
+            // right-hand side of the same assignment.
+            if assign_expr.left.node_id() != node_id {
+                continue;
             }
+
+            if self.1.allow_batch_assign
+                && assignment_chain_has_module_exports(outermost_assignment_id(assign_id, ctx), ctx)
+            {
+                continue;
+            }
+
+            let span = assign_expr.left.span();
+            diagnostics.push((span, unexpected_assignment_diagnostic(span)));
         }
 
-        diagnostics.sort_unstable_by_key(|(start, _)| *start);
+        diagnostics.sort_unstable_by_key(|(span, _)| span.start);
         for (_, diagnostic) in diagnostics {
             ctx.diagnostic(diagnostic);
         }
     }
+}
+
+/// References to the global binding `name`, empty if the file has none or the user turned the
+/// global off with `globals: { <name>: "off" }`.
+///
+/// References in this list are global by construction, so callers don't need to re-check that
+/// with [`LintContext::is_reference_to_global_variable`].
+fn global_reference_ids<'c>(name: &str, ctx: &'c LintContext) -> &'c [ReferenceId] {
+    // Check the reference list first: most files have no CommonJS references at all, and the
+    // `globals` lookup is only worth paying for when there is something to report.
+    let Some(references) = ctx.scoping().root_unresolved_references().get(name) else {
+        return &[];
+    };
+    if ctx.globals().get(name).is_some_and(|value| *value == GlobalValue::Off) {
+        return &[];
+    }
+    references
 }
 
 /// Walk up past the wrapper nodes that [`Expression::get_inner_expression`] unwraps
@@ -254,14 +242,6 @@ fn outermost_wrapped_expression_id(mut node_id: NodeId, ctx: &LintContext) -> No
     node_id
 }
 
-fn is_global_module_exports_kind(member_expr: &MemberExpressionKind, ctx: &LintContext) -> bool {
-    member_expr.static_property_name().is_some_and(|name| name == "exports")
-        && member_expr
-            .object()
-            .get_identifier_reference()
-            .is_some_and(|ident| is_global_module_reference(ident, ctx))
-}
-
 fn assignment_chain_has_exports(top_assignment_id: NodeId, ctx: &LintContext) -> bool {
     assignment_chain_has(top_assignment_id, ctx, |assign_expr| {
         is_global_exports_assignment_target(&assign_expr.left, ctx)
@@ -277,15 +257,17 @@ fn assignment_chain_has_module_exports(top_assignment_id: NodeId, ctx: &LintCont
     })
 }
 
+/// Whether any assignment in a `a = b = c` chain, starting at `top_assignment_id`, matches
+/// `predicate`.
 fn assignment_chain_has(
-    mut node_id: NodeId,
+    top_assignment_id: NodeId,
     ctx: &LintContext,
     predicate: impl Fn(&AssignmentExpression) -> bool,
 ) -> bool {
+    let AstKind::AssignmentExpression(mut assign_expr) = ctx.nodes().kind(top_assignment_id) else {
+        return false;
+    };
     loop {
-        let AstKind::AssignmentExpression(assign_expr) = ctx.nodes().kind(node_id) else {
-            return false;
-        };
         if predicate(assign_expr) {
             return true;
         }
@@ -293,50 +275,42 @@ fn assignment_chain_has(
         let Expression::AssignmentExpression(right_assign_expr) = &assign_expr.right else {
             return false;
         };
-        node_id = right_assign_expr.node_id.get();
+        assign_expr = right_assign_expr;
     }
 }
 
+/// The outermost assignment expression that `node_id` is assigned by, if any.
+///
+/// Member accesses are climbed first, so an `exports` reference resolves through
+/// `exports.foo.bar = 1`, and nested assignments after that, so it resolves to the whole of
+/// `exports = module.exports = {}`.
 fn top_assignment_id(mut node_id: NodeId, ctx: &LintContext) -> Option<NodeId> {
-    while let parent @ (AstKind::StaticMemberExpression(_) | AstKind::ComputedMemberExpression(_)) =
-        ctx.nodes().parent_kind(node_id)
-    {
-        let object_span = match parent {
-            AstKind::StaticMemberExpression(member_expr) => member_expr.object.span(),
-            AstKind::ComputedMemberExpression(member_expr) => member_expr.object.span(),
-            _ => return None,
-        };
-        if object_span != ctx.nodes().kind(node_id).span() {
+    while let Some(member_expr) = ctx.nodes().parent_kind(node_id).as_member_expression_kind() {
+        // Stop if the node is the property rather than the object, as in `foo[exports]`.
+        if member_expr.object().node_id() != node_id {
             break;
         }
         node_id = ctx.nodes().parent_id(node_id);
     }
 
-    let AstKind::AssignmentExpression(assign_expr) = ctx.nodes().parent_kind(node_id) else {
+    let assign_id = ctx.nodes().parent_id(node_id);
+    let AstKind::AssignmentExpression(assign_expr) = ctx.nodes().kind(assign_id) else {
         return None;
     };
-    if assign_expr.left.span() != ctx.nodes().kind(node_id).span() {
+    if assign_expr.left.node_id() != node_id {
         return None;
     }
 
-    node_id = ctx.nodes().parent_id(node_id);
-    while matches!(ctx.nodes().parent_kind(node_id), AstKind::AssignmentExpression(_)) {
-        node_id = ctx.nodes().parent_id(node_id);
-    }
-
-    Some(node_id)
+    Some(outermost_assignment_id(assign_id, ctx))
 }
 
-fn top_assignment_from_assignment_id(mut node_id: NodeId, ctx: &LintContext) -> Option<NodeId> {
-    if !matches!(ctx.nodes().kind(node_id), AstKind::AssignmentExpression(_)) {
-        return None;
-    }
-
+/// Climb from an assignment expression to the outermost one enclosing it, as in
+/// `a = b = c` from `b = c`.
+fn outermost_assignment_id(mut node_id: NodeId, ctx: &LintContext) -> NodeId {
     while matches!(ctx.nodes().parent_kind(node_id), AstKind::AssignmentExpression(_)) {
         node_id = ctx.nodes().parent_id(node_id);
     }
-
-    Some(node_id)
+    node_id
 }
 
 #[test]
@@ -378,6 +352,10 @@ fn test() {
             None,
         ),
         ("module = {}; module.foo = 1", Some(serde_json::json!(["exports"])), None),
+        // `exports` is read, not assigned to
+        ("foo = exports", Some(serde_json::json!(["exports"])), None),
+        // `module` is the property, not the object
+        ("foo[module] = 1", Some(serde_json::json!(["exports"])), None),
         (
             "exports.foo = 1",
             Some(serde_json::json!(["module.exports"])),
@@ -440,6 +418,8 @@ fn test() {
         ),
         ("module.exports = exports = {foo: 1}", Some(serde_json::json!(["exports"])), None),
         ("exports = module.exports = {foo: 1}", Some(serde_json::json!(["exports"])), None),
+        ("(module).exports = {foo: 1}", Some(serde_json::json!(["exports"])), None),
+        ("(module as any).exports = {foo: 1}", Some(serde_json::json!(["exports"])), None),
         (
             "module.exports = exports = {foo: 1}; exports = obj",
             Some(serde_json::json!(["exports", { "allowBatchAssign": true }])),
